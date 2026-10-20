@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 from app.database.database import get_db
 from app.models.project import Project
 from app.models.scan import Scan
+from app.models.finding import Finding
+from app.services.scanner import InvalidTarget, ScanNetworkError, scan as run_scan
 
 
 router = APIRouter(
@@ -52,6 +54,54 @@ def create_scan(
     )
 
     db.add(scan)
+    db.commit()
+    db.refresh(scan)
+
+    # Execute the bounded scanner synchronously so API clients see a terminal state.
+    scan.status = "running"
+    scan.started_at = datetime.now(timezone.utc)
+    target_url = project.target_url or "http://127.0.0.1:3000"
+    db.commit()
+    try:
+        _, findings = run_scan(target_url)
+        for item in findings:
+            db.add(Finding(
+                scan_id=scan.id,
+                title=item.title,
+                vulnerability_type=item.vulnerability_type,
+                severity=item.severity,
+                url=item.url,
+                description=item.description,
+                evidence=item.evidence,
+                remediation=item.remediation,
+                status="open",
+            ))
+        scan.status = "completed"
+    except InvalidTarget as exc:
+        db.rollback()
+        scan = db.query(Scan).filter(Scan.id == scan.id).first()
+        scan.status = "failed"
+        scan.started_at = scan.started_at or datetime.now(timezone.utc)
+        scan.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ScanNetworkError:
+        db.rollback()
+        scan = db.query(Scan).filter(Scan.id == scan.id).first()
+        scan.status = "failed"
+        scan.started_at = scan.started_at or datetime.now(timezone.utc)
+        scan.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=502, detail="Target scan failed")
+    except Exception:
+        db.rollback()
+        scan = db.query(Scan).filter(Scan.id == scan.id).first()
+        scan.status = "failed"
+        scan.started_at = scan.started_at or datetime.now(timezone.utc)
+        scan.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise
+    scan.completed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(scan)
 
