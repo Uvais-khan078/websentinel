@@ -37,7 +37,9 @@ def test_redirect_destination_validated_before_request():
         factory.return_value.get.return_value = response(302, {"Location": "http://example.com/"})
         with pytest.raises(InvalidTarget):
             fetch_target("http://127.0.0.1:3000/redirect")
+        # The first request retrieves the redirect response; no request is sent to its destination.
         assert factory.return_value.get.call_count == 1
+        assert factory.return_value.get.call_args.args == ("http://127.0.0.1:3000/redirect",)
 
 
 def test_network_failure_not_a_finding():
@@ -80,3 +82,34 @@ def test_network_failure_marks_scan_failed_without_finding():
                 create_scan(ScanCreate(project_id=project.id), db)
         assert db.query(Scan).one().status == "failed"
         assert db.query(Finding).count() == 0
+
+
+def test_present_security_headers_produce_no_missing_header_findings():
+    from app.services.scanner import ScanObservation, check_headers
+    observation = ScanObservation(
+        url="http://127.0.0.1:3000/",
+        status_code=200,
+        headers={
+            "Content-Security-Policy": "default-src 'self'",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "SAMEORIGIN",
+            "Referrer-Policy": "strict-origin-when-cross-origin",
+        },
+        content_type="text/html",
+        content_length=100,
+    )
+    assert check_headers(observation) == []
+
+
+def test_each_repeated_scan_request_creates_a_separate_scan():
+    with Session() as db:
+        project = Project(name="lab", target_url="http://127.0.0.1:3000")
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+        with patch("app.api.routes.scans.run_scan", return_value=(object(), [])) as scanner:
+            first = create_scan(ScanCreate(project_id=project.id), db)
+            second = create_scan(ScanCreate(project_id=project.id), db)
+        assert first.id != second.id
+        assert scanner.call_count == 2
+        assert db.query(Scan).filter_by(project_id=project.id).count() == 2
